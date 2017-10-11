@@ -109,12 +109,41 @@ def test_listing():
     assert rm_whitespace(run(preamble, 'ls bucket/listing/d')) == rm_whitespace("""
           PRE dir1/
     """)
+    assert rm_whitespace(run(preamble, 'ls bucket/listing/')) == rm_whitespace("""
+          PRE dir1/
+    """)
     assert rm_whitespace(run(preamble, 'ls bucket/listing/d --recursive')) == rm_whitespace("""
+        _ _ _ listing/dir1/dir2/key2.txt
+        _ _ _ listing/dir1/key1.txt
+    """)
+    assert rm_whitespace(run(preamble, 'ls bucket/listing/ --recursive')) == rm_whitespace("""
         _ _ _ listing/dir1/dir2/key2.txt
         _ _ _ listing/dir1/key1.txt
     """)
     with pytest.raises(AssertionError):
         run(preamble, 'ls bucket/fake/')
 
+def test_rm():
+    run(preamble, 'rm s3://bucket/rm/di --recursive')
+    run('echo |', preamble, 'cp - s3://bucket/rm/dir1/key1.txt')
+    run('echo |', preamble, 'cp - s3://bucket/rm/dir1/dir2/key2.txt')
+    assert rm_whitespace(run(preamble, 'ls bucket/rm/ --recursive')) == rm_whitespace("""
+        _ _ _ rm/dir1/dir2/key2.txt
+        _ _ _ rm/dir1/key1.txt
+    """)
+    run(preamble, 'rm s3://bucket/rm/dir1/key1.txt')
+    assert rm_whitespace(run(preamble, 'ls bucket/rm/ --recursive')) == rm_whitespace("""
+        _ _ _ rm/dir1/dir2/key2.txt
+    """)
+    run(preamble, 'rm s3://bucket/rm/di --recursive')
+    assert rm_whitespace(run(preamble, 'ls bucket/rm/ --recursive')) == ''
+
 def test_prefixes():
     assert ["", "a/", "a/b/", "a/b/c/"] == s3._prefixes('a/b/c/d.csv')
+
+def test_binary():
+    with shell.tempdir():
+        with open('1.txt', 'w') as f:
+            f.write('123')
+        run('cat 1.txt | lz4 -1 |', preamble, 'cp - s3://bucket/binary/1.txt')
+        assert '123' == run(preamble, 'cp s3://bucket/binary/1.txt - | lz4 -d -c')

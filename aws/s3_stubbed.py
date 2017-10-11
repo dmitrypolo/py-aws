@@ -19,6 +19,32 @@ def _prefixes(key):
     xs = ['/'.join(xs[:i]) + '/' for i, _ in enumerate(xs, 1)]
     return [""] + xs
 
+def rm(url, recursive=False):
+    url = url.split('s3://')[-1]
+    if recursive:
+        try:
+            with open(_cache_path_prefix(url)) as f:
+                xs = f.read().splitlines()
+        except FileNotFoundError:
+            try:
+                url = os.path.dirname(url) + '/'
+                with open(_cache_path_prefix(url)) as f:
+                    xs = [x for x in f.read().splitlines() if x.startswith(url)]
+            except FileNotFoundError:
+                sys.exit(0)
+        for x in set(xs):
+            rm(x)
+    else:
+        if not os.path.isfile(_cache_path(url)):
+            sys.exit(1)
+        else:
+            os.remove(_cache_path(url))
+            for prefix in _prefixes(url):
+                with open(_cache_path_prefix(prefix)) as f:
+                    val = '\n'.join([x for x in f.read().splitlines() if x != url])
+                with open(_cache_path_prefix(prefix), 'w') as f:
+                    f.write(val)
+
 def ls(url, recursive=False):
     orig_url = url = url.split('s3://')[-1]
     try:
@@ -67,26 +93,26 @@ def cp(src, dst, recursive=False):
     elif src.startswith('s3://'):
         src = src.split('s3://')[1]
         try:
-            with open(_cache_path(src)) as f:
+            with open(_cache_path(src), 'rb') as f:
                 x = f.read()
         except FileNotFoundError:
             sys.exit(1)
         if dst == '-':
-            print(x)
+            sys.stdout.buffer.write(x)
         elif os.path.isdir(dst):
-            with open(os.path.join(dst, os.path.basename(src)), 'w') as f:
+            with open(os.path.join(dst, os.path.basename(src)), 'wb') as f:
                 f.write(x)
         else:
-            with open(dst, 'w') as f:
+            with open(dst, 'wb') as f:
                 f.write(x)
     elif dst.startswith('s3://'):
         if src == '-':
-            x = sys.stdin.read()
+            x = sys.stdin.buffer.read()
         else:
-            with open(src) as f:
+            with open(src, 'rb') as f:
                 x = f.read()
         dst = dst.split('s3://')[1]
-        with open(_cache_path(dst), 'w') as f:
+        with open(_cache_path(dst), 'wb') as f:
             f.write(x)
         for prefix in _prefixes(dst):
             with open(_cache_path_prefix(prefix), 'a') as f:
@@ -128,6 +154,12 @@ def main():
                     for x in ls(sys.argv[2], len(sys.argv) > 3 and sys.argv[3] == '--recursive'):
                         print(x)
             elif cmd == 'rm':
-                print('rm not implemented')
+                if len(sys.argv) < 3:
+                    print('usage: aws s3 rm URL [--recursive]')
+                    sys.exit(1)
+                else:
+                    rm(sys.argv[2], len(sys.argv) > 3 and sys.argv[3] == '--recursive')
+            elif cmd == 'clear-storage':
+                clear_storage()
             else:
                 sys.exit(1)

@@ -1,4 +1,5 @@
 import boto3
+import uuid
 import collections
 import json
 import contextlib
@@ -42,7 +43,7 @@ def _now():
 
 def _retry(f):
     """
-    retry and idempotent fn a few times
+    retry an idempotent fn a few times
     """
     def fn(*a, **kw):
         for i in itertools.count():
@@ -119,8 +120,7 @@ def _ls(tags, state='running', first_n=None, last_n=None):
                 filters += [{'Name': 'instance-id', 'Values': tags_chunk}]
                 instances += list(_resource().instances.filter(Filters=filters))
             elif is_sg_id:
-                filters += [{'Name': 'group-id', 'Values': tags_chunk}, # ec2 classic
-                            {'Name': 'instance.group-id', 'Values': tags_chunk}] # ec2 modern
+                filters += [{'Name': 'instance.group-id', 'Values': tags_chunk}] # ec2 modern
                 instances += list(_resource().instances.filter(Filters=filters))
             elif any('*' in tag for tag in tags_chunk):
                 instances += [i for i in _resource().instances.filter(Filters=filters) if _matches(i, tags_chunk)]
@@ -252,15 +252,24 @@ def ls(*tags, state='all', first_n=None, last_n=None, all_tags=False):
         return xs
 
 
-def _remote_cmd(cmd, instance_id):
-    return 'fail_msg="failed to run cmd on instance: %s"; mkdir -p ~/.cmds || echo $fail_msg; path=~/.cmds/$(uuidgen); echo %s | base64 -d > $path || echo $fail_msg; bash $path; code=$?; if [ $code != 0 ]; then echo $fail_msg; exit $code; fi' % (instance_id, util.strings.b64_encode(cmd)) # noqa
+def _remote_cmd(cmd, stdin, instance_id):
+    return 'fail_msg="failed to run cmd on instance: %s"; mkdir -p ~/.cmds || echo $fail_msg; path=~/.cmds/$(uuidgen); input=$path.input; echo %s | base64 -d > $path || echo $fail_msg; echo %s | base64 -d > $input || echo $fail_msg; cat $input | bash $path; code=$?; if [ $code != 0 ]; then echo $fail_msg; exit $code; fi' % (instance_id, util.strings.b64_encode(cmd), util.strings.b64_encode(stdin)) # noqa
 
+class _instance:
+    def __init__(self, ip):
+        self.instance_id = ip
+        self.public_dns_name = ip
+        self.private_ip_address = ip
+        self.tags = [{'Key': 'Name', 'Value': ip}]
 
 def ssh(
         *tags,
         first_n=None,
         last_n=None,
+        stdin: 'stdin value to be provided to remote cmd' = '',
         quiet: 'less output' = False,
+        no_stream: 'dont stream to stderr, only output to stdout' = False,
+        stream_only: 'dont accumulate output for stdout, only stream to stderr' = False,
         cmd: 'cmd to run on remote host, can also be a file which will be read' ='',
         yes: 'no prompt to proceed' = False,
         max_threads: 'max ssh connections' = 20,
@@ -276,7 +285,12 @@ def ssh(
     # no_tty is the opposite, which is good for backgrounding processes, for example: `ec2 ssh $host -nyc 'bash cmd.sh </dev/null &>cmd.log &'
     # TODO backgrounding appears to succeed, but ec2 ssh never exits, when targeting more than 1 host?
     assert tags, 'you must specify some tags'
-    instances = _ls(tags, 'running', first_n, last_n)
+    if hasattr(tags[0], 'instance_id'):
+        instances = tags
+    elif tags[0].endswith('.com') or tags[0].count('.') == 3 and tags[0].replace('.', '').isdigit() and not tags[0].startswith('10.'):
+        instances = [_instance(tag) for tag in tags]
+    else:
+        instances = _ls(tags, 'running', first_n, last_n)
     assert instances, 'didnt find any instances'
     if os.path.exists(cmd):
         with open(cmd) as f:
@@ -290,30 +304,35 @@ def ssh(
             cmd = '\n'.join(lines)
         else:
             cmd = 'set -e\n' + cmd
-    assert (cmd and instances) or len(instances) == 1, 'didnt find instances:\n%s' % ('\n'.join(_pretty(i) for i in instances) or '<nothing>')
+    if not isinstance(instances[0], _instance):
+        assert (cmd and instances) or len(instances) == 1, 'didnt find instances:\n%s' % ('\n'.join(_pretty(i) for i in instances) or '<nothing>')
     if not (quiet and yes):
-        for i in instances:
-            logging.info(_pretty(i))
+        if not isinstance(instances[0], _instance):
+            for i in instances:
+                logging.info(_pretty(i))
+        else:
+            for i in instances:
+                logging.info(i.instance_id)
     ssh_cmd = ('ssh -A' + (' -i {} '.format(key) if key else '') + (' -tt ' if not no_tty or not cmd else ' -T ') + ssh_args).split()
     if echo:
         logging.info('ec2.ssh running against tags: %s, with cmd: %s', tags, cmd)
     if timeout:
         ssh_cmd = ['timeout', '{}s'.format(timeout)] + ssh_cmd
-    make_ssh_cmd = lambda instance: ssh_cmd + [user + '@' + instance.public_dns_name, _remote_cmd(cmd, instance.instance_id)]
+    make_ssh_cmd = lambda instance: ssh_cmd + [user + '@' + instance.public_dns_name, _remote_cmd(cmd, stdin, instance.instance_id)]
     if is_cli and not yes and not (len(instances) == 1 and not cmd):
         logging.info('\nwould you like to proceed? y/n\n')
         assert pager.getch() == 'y', 'abort'
-    # TODO have a --stream-only to not accumulate lines for return, here, or in shell.run
     try:
         if cmd and len(instances) > 1 or batch_mode:
             failures = []
             successes = []
-            results = []
+            results = None if stream_only else []
             def run(instance):
                 def fn():
                     try:
                         shell.run(*make_ssh_cmd(instance),
-                                  callback=_make_callback(instance, quiet, results),
+                                  callback=_make_callback(instance, quiet, results, no_stream),
+                                  stream_only=stream_only,
                                   echo=False,
                                   raw_cmd=True,
                                   stream=False,
@@ -342,30 +361,31 @@ def ssh(
                 logging.info('\ntotals:')
                 logging.info(util.colors.green(' successes: ') + str(len(successes)))
                 logging.info(util.colors.red(' failures: ') + str(len(failures)))
-            if failures:
-                sys.exit(1)
-            else:
-                return results
+            for result in results:
+                print(result)
+            assert not failures
         elif cmd:
             return shell.run(*make_ssh_cmd(instances[0]),
                              echo=False,
-                             stream=not prefixed,
+                             stream=not prefixed and not no_stream,
+                             stream_only=stream_only,
                              hide_stderr=quiet,
                              raw_cmd=True,
-                             callback=_make_callback(instances[0], quiet) if prefixed else None)
+                             callback=_make_callback(instances[0], quiet, None, no_stream) if prefixed else None)
         else:
             subprocess.check_call(ssh_cmd + [user + '@' + instances[0].public_dns_name])
     except:
-        sys.exit(1)
+        raise
 
 
-def _make_callback(instance, quiet, append=None):
+def _make_callback(instance, quiet, append=None, no_stream=False):
     name = _name(instance) + ': ' + instance.public_dns_name + ': '
     def f(x):
         val = (x if quiet else name + x).replace('\r', '')
-        if append:
+        if append is not None:
             append.append(val)
-        print(val, flush=True)
+        if not no_stream:
+            logging.info(val)
     return f
 
 
@@ -524,16 +544,15 @@ def stop(*tags, yes=False, first_n=None, last_n=None, wait=False):
     if is_cli and not yes:
         logging.info('\nwould you like to proceed? y/n\n')
         assert pager.getch() == 'y', 'abort'
-    for i in instances:
-        i.stop()
-        logging.info('stopped: %s', _pretty(i))
+    _retry(_client().stop_instances)(InstanceIds=[i.instance_id for i in instances])
     if wait:
         logging.info('waiting for all to stop')
         _wait_for_state('stopped', *instances)
 
 
 def rm(*tags, yes=False, first_n=None, last_n=None):
-    assert tags, 'you cannot stop all things, specify some tags'
+    assert tags, 'you cannot rm all things, specify some tags'
+    assert tags != ('*',), 'you cannot rm all things'
     instances = _ls(tags, ['running', 'stopped', 'pending'], first_n, last_n)
     assert instances, 'didnt find any instances for those tags'
     logging.info('going to terminate the following instances:')
@@ -542,9 +561,7 @@ def rm(*tags, yes=False, first_n=None, last_n=None):
     if is_cli and not yes:
         logging.info('\nwould you like to proceed? y/n\n')
         assert pager.getch() == 'y', 'abort'
-    for i in instances:
-        i.terminate()
-        logging.info('terminated: %s', _pretty(i))
+    _retry(_client().terminate_instances)(InstanceIds=[i.instance_id for i in instances])
 
 
 def _ls_by_ids(*ids):
@@ -587,7 +604,7 @@ def _wait_for_ssh(*instances, seconds=0):
             running_ids = ' '.join([i.instance_id for i in running])
             res = shell.run('ec2 ssh', running_ids, '--batch-mode -t 10 -yc "whoami>/dev/null" 2>&1', warn=True)
             ready_ids = [x.split()[-1]
-                         for x in res['output'].splitlines()
+                         for x in res['stdout'].splitlines()
                          if x.startswith('success: ')]
             num_ready = len(ready_ids)
             num_not_ready = len(instances) - num_ready
@@ -642,11 +659,10 @@ def tag(ls_tags, set_tags, yes=False, first_n=None, last_n=None):
     if is_cli and not yes:
         logging.info('\nwould you like to proceed? y/n\n')
         assert pager.getch() == 'y', 'abort'
-    for i in instances:
-        for t in set_tags.split(','):
-            k, v = t.split('=')
-            _retry(i.create_tags)(Tags=[{'Key': k, 'Value': v}])
-            logging.info('tagged: %s', _pretty(i))
+    _retry(_client().create_tags)(
+        Resources=[i.instance_id for i in instances],
+        Tags=[{'Key': k, 'Value': v} for t in set_tags.split(',') for k, v in [t.split('=')]]
+    )
 
 
 def wait(*tags, state='running', yes=False, first_n=None, last_n=None, ssh=False):
@@ -679,9 +695,7 @@ def reboot(*tags, yes=False, first_n=None, last_n=None):
     if is_cli and not yes:
         logging.info('\nwould you like to proceed? y/n\n')
         assert pager.getch() == 'y', 'abort'
-    for i in instances:
-        i.reboot()
-        logging.info('rebooted: %s', _pretty(i))
+    _client().reboot_instances(InstanceIds=[i.instance_id for i in instances])
 
 
 def _has_wildcard_permission(sg, ip):
@@ -775,7 +789,7 @@ def authorize(ip, *names, yes=False):
         logging.info('\nwould you like to authorize access to these groups for your ip %s? y/n\n', util.colors.yellow(ip))
         assert pager.getch() == 'y', 'abort'
     with open('/var/log/ec2_auth_ips.log', 'a') as f:
-        f.write(ip + '\n')
+        f.write(ip + ' ' + ','.join(names) + '\n')
     for sg in sgs:
         for proto in ['tcp', 'udp']:
             try:
@@ -833,12 +847,20 @@ def amis_all(id_only=False):
         return [ami.image_id for ami in amis]
     else:
         def f(ami):
-            name, date = ami.name.split('__')
-            description = ami.description if ami.description != name else '-'
-            tag = '%(Key)s=%(Value)s' % ami.tags[0] if ami.tags else '-'
-            return ' '.join([name, ami.image_id, date, description, tag])
+            try:
+                name, date = ami.name.split('__')
+            except ValueError:
+                return
+            else:
+                description = ami.description or '-' if ami.description != name else '-'
+                tag = '%(Key)s=%(Value)s' % ami.tags[0] if ami.tags else '-'
+                try:
+                    return ' '.join([name, ami.image_id, date, description, tag])
+                except:
+                    print([name, ami.image_id, date, description, tag], '???')
         logging.info('id date description tag')
-        return [f(ami) for ami in amis]
+        xs = [f(ami) for ami in amis]
+        return [x for x in xs if x]
 
 
 def amis(name, *tags, id_only=False, most_recent=False):
@@ -884,9 +906,7 @@ def amis_ubuntu(*name_fragments, ena=False, sriov=False):
     filters = [{'Name': 'name',
                 'Values': ['*%s*' % '*'.join(name_fragments)]},
                {'Name': 'architecture',
-                'Values': ['x86_64']},
-               {'Name': 'virtualization-type',
-                'Values': ['hvm']}]
+                'Values': ['x86_64']}]
     if ena:
         filters.append({'Name': 'ena-support',
                         'Values': ['true']})
@@ -1033,7 +1053,8 @@ sudo mount -o discard /dev/nvme0n1p1 /mnt
 sudo chown -R ubuntu:ubuntu /mnt
 """
 
-
+# TODO switch to spot fleets for creating spot instances
+# TODO switch to TagSpecifications in create_instances() and create_spot_fleet() so we can set tags at creation time
 def new(name:  'name of the instance',
         *tags: 'tags to set as "<key>=<value>"',
         key:   'key pair name'               = shell.conf.get_or_prompt_pref('key',  __file__, message='key pair name'),
@@ -1041,6 +1062,7 @@ def new(name:  'name of the instance',
         sg:    'security group name'         = shell.conf.get_or_prompt_pref('sg',   __file__, message='security group name'),
         type:  'instance type'               = shell.conf.get_or_prompt_pref('type', __file__, message='instance type'),
         vpc:   'vpc name'                    = shell.conf.get_or_prompt_pref('vpc',  __file__, message='vpc name'),
+        subnet: 'subnet id'                = None,
         role:  'ec2 iam role'                = None,
         zone:  'ec2 availability zone'       = None,
         gigs:  'gb capacity of primary gp2 disk' = 8,
@@ -1117,7 +1139,10 @@ def new(name:  'name of the instance',
         if zone:
             opts['Placement'] = {'AvailabilityZone': zone}
         if vpc:
-            opts['SubnetId'] = _subnet(vpc, zone)
+            if subnet is not None:
+                opts['SubnetId'] = subnet
+            else:
+                opts['SubnetId'] = _subnet(vpc, zone)
             logging.info('using vpc: %s', vpc)
         else:
             logging.info('using ec2-classic')
@@ -1138,19 +1163,14 @@ def new(name:  'name of the instance',
             logging.info('create instances:\n' + pprint.pformat(util.dicts.drop(opts, ['UserData'])))
             instances = _resource().create_instances(**opts)
         logging.info('instances:\n%s', '\n'.join([i.instance_id for i in instances]))
-        date = _now()
-        for n, i in enumerate(instances):
-            set_tags = [{'Key': 'Name', 'Value': name},
-                        {'Key': 'owner', 'Value': owner},
-                        {'Key': 'creation-date', 'Value': date}]
-            if len(instances) > 1:
-                set_tags += [{'Key': 'nth', 'Value': str(n)},
-                             {'Key': 'num', 'Value': str(num)}]
-            for tag in tags:
-                k, v = tag.split('=')
-                set_tags.append({'Key': k, 'Value': v})
-            _retry(i.create_tags)(Tags=set_tags)
-            logging.info('tagged: %s', _pretty(i))
+        _retry(_client().create_tags)(
+            Resources=[i.instance_id for i in instances],
+            Tags=[{'Key': 'Name', 'Value': name},
+                  {'Key': 'owner', 'Value': owner},
+                  {'Key': 'creation-date', 'Value': _now()},
+                  {'Key': 'num', 'Value': str(num)}] + [{'Key': k, 'Value': v}
+                                                        for tag in tags
+                                                        for k, v in [tag.split('=')]])
         if no_wait:
             break
         else:
@@ -1231,7 +1251,7 @@ def _spot_price_history(type, kind, days=7):
     # TODO may even be worth reverting to older, simpler behavior,
     # which is cache free, but way simpler. it could also be slightly
     # faster by gather all zone data in a single request cycle,
-    # instead of seperate cycles.
+    # instead of separate cycles.
     # https://github.com/nathants/py-aws/blob/83bf766/aws/ec2.py#L1040
 
     assert kind in _kinds
@@ -1333,9 +1353,7 @@ def start(*tags, yes=False, first_n=None, last_n=None, login=False, wait=False):
     if is_cli and not yes:
         logging.info('\nwould you like to proceed? y/n\n')
         assert pager.getch() == 'y', 'abort'
-    for i in instances:
-        i.start()
-        logging.info('started: %s', _pretty(i))
+    _retry(_client().start_instances)(InstanceIds=[i.instance_id for i in instances])
     if login:
         assert len(instances) == 1, util.colors.red('you asked to ssh, but you started more than one instance, so its not gonna happen')
         instances[0].wait_until_running()
@@ -1499,7 +1517,7 @@ def snapshots(regex=None, min_date=None, make_ami=False, yes=False):
             v = vs[0]
             block = _blocks(v['size'])[0]
             block['Ebs']['SnapshotId'] = v['id']
-            name = '%s__%s' % (v['name'], v['date'].replace(':', '_'))
+            name = '%s__%s__%s' % (v['name'], v['instance_id'], v['date'].replace(':', '_'))
             id = _client().register_image(
                 Name=name,
                 Architecture='x86_64',
@@ -1595,6 +1613,95 @@ def reserved_usage():
     logging.info('positive number means some reservations are unused')
     logging.info('negative number means there are instances which could be reserved')
     return json.dumps(usage, indent=4)
+
+
+def _stderr_file(arg_num):
+    return 'nohup.%(arg_num)s.stderr' % locals()
+
+
+def _stdout_file(arg_num):
+    return 'nohup.%(arg_num)s.stdout' % locals()
+
+
+def _cmd(cmd, arg_num, worker_num):
+    cmd = cmd.format(worker_num=worker_num)
+    stdout = _stdout_file(arg_num)
+    stderr = _stderr_file(arg_num)
+    stdin = 'stdin.%s' % arg_num
+    return 'set +e; rm -f nohup.* stdin.*; cat - > %(stdin)s; (echo "cat %(stdin)s | (%(cmd)s)" 1>&2; cat %(stdin)s | (%(cmd)s); echo exited: $? 1>&2;) > %(stdout)s 2> %(stderr)s </dev/null &' % locals()
+
+
+# TODO should print an eta based on rate of args and total args
+def pmap(instance_ids: 'comma separated ec2 instance ids to run cmds on',
+         args: 'comma separated strings which will be supplied as stdin to cmd',
+         cmd: '{worker_num} can be used as a unique integer id per worker',
+         retries: 'how many times to retry each arg' = 10,
+         retry_sleep: 'seconds to sleep before retrying' = 30):
+    args = args.split(',')
+    instance_ids = instance_ids.split(',')
+    if instance_ids[0].endswith('.com') or instance_ids[0].count('.') == 3 and instance_ids[0].replace('.', '').isdigit():
+        instances = [_instance(tag) for tag in instance_ids]
+    else:
+        instances = list(_ls(instance_ids, state='running'))
+    assert len(instances) == len(instance_ids)
+    nums = {instance: i for i, instance in enumerate(instances)}
+    active = {}
+    results = {}
+    numbered_args = list(reversed(list(enumerate(args))))
+    retried = collections.Counter()
+    session = str(uuid.uuid4()).split('-')[-1]
+    # process every arg
+    while numbered_args or active:
+        assert len(active) <= len(instances)
+        # start jobs on available instances
+        def start(x):
+            instance, (arg_num, arg) = x
+            ssh(instance,
+                cmd=_cmd(cmd, arg_num, nums[instance]),
+                no_tty=True,
+                yes=True,
+                quiet=True,
+                stdin=arg)
+            active[instance] = (arg_num, arg)
+            logging.info('started: arg_num: %s, instance: %s, session: %s', arg_num, instance.instance_id, session)
+        random.shuffle(instances)
+        to_start = [(i, numbered_args.pop())
+                    for i in instances
+                    if i not in active
+                    and numbered_args]
+        list(pool.thread.map(start, to_start))
+        # check for completed jobs and handle outputs
+        def check(x):
+            instance, (arg_num, arg) = x
+            res = _retry(ssh)(
+                instance,
+                cmd='tail -n1 %s' % _stderr_file(arg_num),
+                quiet=True,
+                no_stream=True,
+                yes=True,
+            )
+            if res.startswith('exited: '):
+                code = res.split()[-1]
+                if code == '0':
+                    logging.info('success: arg_num: %s, instance: %s, session: %s', arg_num, instance.instance_id, session)
+                    results[arg_num] = _retry(ssh)(
+                        instance,
+                        cmd='cat %s' % _stdout_file(arg_num),
+                        quiet=True,
+                        no_stream=True,
+                        yes=True,
+                    )
+                    del active[instance]
+                else:
+                    retried[arg_num] += 1
+                    assert retried[arg_num] < retries, 'error: arg_num: %s, instance: %s, retried: %s, session: %s' % (arg_num, instance.instance_id, retries, session)
+                    logging.info('retrying: arg_num: %s, instance: %s, retried: %s, session: %s', arg_num, instance.instance_id, retried[arg_num], session)
+                    numbered_args.append((arg_num, arg))
+                    time.sleep(retry_sleep)
+
+        list(pool.thread.map(check, list(active.items())))
+    assert len(results) == len(args), 'mismatch result sizes'
+    return [results[arg_num] for arg_num, _ in enumerate(args)]
 
 
 def main():
